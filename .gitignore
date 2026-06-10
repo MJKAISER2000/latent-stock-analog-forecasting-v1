@@ -1,0 +1,48 @@
+# Virtual environments
+.venv/
+.venv312/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# Generated data
+data/raw/
+data/cache/
+data/processed/
+data/interim/
+
+# Generated outputs
+outputs/
+runs/
+checkpoints/
+logs/
+models/
+
+# Large ML/data files
+*.csv
+*.parquet
+*.pkl
+*.joblib
+*.pt
+*.pth
+*.npy
+*.npz
+
+# Secrets
+.env
+*.key
+*.pem
+credentials.json
+token.json
+
+# IDE/system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

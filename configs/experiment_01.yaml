@@ -1,0 +1,34 @@
+experiment_name: experiment_01_large_cap_monthly
+
+start_date: "2000-01-01"
+end_date: "2026-01-01"
+
+benchmark: "SPY"
+
+tickers:
+  - AAPL
+  - MSFT
+  - NVDA
+  - GOOGL
+  - AMZN
+  - META
+  - JPM
+  - XOM
+  - UNH
+  - WMT
+  - PG
+  - KO
+  - HD
+  - COST
+  - AVGO
+  - LLY
+  - TSLA
+  - V
+  - MA
+  - NFLX
+
+prediction_horizon_months: 12
+rebalance_frequency: "monthly"
+
+raw_data_dir: "data/raw"
+processed_data_dir: "data/processed"

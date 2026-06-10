@@ -1,0 +1,59 @@
+project_name: latent_market_twin_live
+final_model_name: LTSAF_live_v1
+paths:
+  base_dataset: data/processed/live_full500_modeling_dataset.parquet
+  neighbor_dataset: data/processed/live_full500_with_stock_latent_neighbors.parquet
+  monthly_prices: data/processed/live_500_monthly_prices.parquet
+  universe: data/external/week15_500_stock_universe.csv
+  outputs_dir: outputs/paper_trading_live
+  tables_dir: outputs/tables
+  reports_dir: outputs/reports
+  models_dir: models
+model:
+  prediction_horizon_months: 1
+  prediction_years:
+  - 2021
+  - 2022
+  - 2023
+  - 2024
+  - 2025
+  - 2026
+  ranker:
+    objective: lambdarank
+    metric: ndcg
+    n_estimators: 500
+    learning_rate: 0.03
+    num_leaves: 31
+    max_depth: -1
+    min_child_samples: 20
+    subsample: 1.0
+    colsample_bytree: 1.0
+    reg_alpha: 0.1
+    reg_lambda: 1.0
+    random_state: 42
+portfolio:
+  original_branch:
+    feature_set: original_only
+    top_n: 20
+    weight: 0.7
+  latent_neighbor_branch:
+    feature_set: neighbor_only
+    top_n: 10
+    weight: 0.3
+  weighting:
+    method: inverse_volatility
+    vol_column: vol_12m
+  transaction_cost: 0.001
+regime_filter:
+  enabled: true
+  rule: tech_drawdown_20
+  cash_weight_when_off: 1.0
+  tech_sector_name: Information Technology
+  drawdown_threshold: -0.2
+paper_trading:
+  starting_cash: 100000
+  rebalance_frequency: monthly
+  signal_date_mode: latest_available_month
+  save_rankings: true
+  save_portfolio_weights: true
+  save_trade_log: true
