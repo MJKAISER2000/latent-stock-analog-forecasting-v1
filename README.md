@@ -2,6 +2,105 @@
 
 This project tests whether latent representation learning can improve long-term stock prediction and portfolio construction.
 
+The sections below explain how the live paper-trading system actually works today. Everything after that is the week-by-week research log that led here.
+
+## How The Live System Works
+
+The live system (model name `LTSAF_live_v1`, config at `configs/live_model_config.yaml`) runs a ~500-stock U.S. equity universe through a feature/latent pipeline, ranks stocks monthly with a two-branch LightGBM model, builds a regime-aware portfolio, and paper-trades it with a real cash simulation ($100,000 starting capital). All live artifacts live under `outputs/paper_trading_live/`; the older, separate "frozen" research pipeline (`outputs/paper_trading/`, `run_monthly_update.py`) is a static baseline kept for comparison and is not the live system described here.
+
+### 1. Universe and price data
+
+- Universe: `data/external/week15_500_stock_universe.csv`, roughly 500 current U.S. large-cap tickers. This is a current-constituent list, not survivorship-bias-free.
+- `scripts/refresh_live_monthly_prices.py` downloads daily adjusted closes for the whole universe (plus SPY) via `yfinance`, resamples to month-end, and computes monthly returns. Outputs: `data/processed/live_500_daily_prices.parquet`, `live_500_monthly_prices.parquet`, `live_500_monthly_returns.parquet`.
+- `scripts/compare_live_vs_research_prices.py` is an optional sanity check that diffs the freshly downloaded live prices against the frozen research price history.
+
+### 2. Feature engineering
+
+`scripts/build_live_base_features.py` turns the raw price panel into one row per stock per month with:
+
+- trailing return / moving-average / volatility / drawdown features per stock
+- SPY market return and volatility features
+- sector and industry one-hot features, plus sector-relative return/vol/drawdown features
+- a per-month ranking label: stocks are bucketed by percentile of realized next-month return within each date, which is what the ranker is trained to reproduce
+
+Output: `data/processed/live_full500_modeling_dataset.parquet`.
+
+### 3. Latent stock-state model (the "market twin")
+
+This is the actual latent-representation piece the project is named for:
+
+- `scripts/build_live_stock_state_pca.py` takes the non-leakage engineered features for every stock-month, standardizes them, and compresses them into a handful of PCA latent dimensions describing each stock's "state" that month. Output: `data/processed/live_stock_state_pca_latents_with_metadata.parquet`.
+- `scripts/build_live_latent_neighbors.py` then finds, for every stock-month, its nearest neighbors in that latent space among all historical stock-months, and derives neighbor-based features (e.g. `neighbor_avg_future_1m_excess_return`, `neighbor_outperform_spy_1m_rate`) summarizing how similar-latent-state stocks actually performed afterward. Output merged into `data/processed/live_full500_with_stock_latent_neighbors.parquet`.
+
+### 4. Two-branch LightGBM ranker
+
+`scripts/run_live_final_pipeline.py` trains two independent LightGBM LambdaRank models on the latest available month and blends them:
+
+| Branch | Feature set | Selection | Weight |
+|---|---|---|---|
+| Original | every engineered feature except the `neighbor_*` columns | top 20 by score | 70% |
+| Latent-neighbor | only the `neighbor_*` latent-neighbor features | top 10 by score | 30% |
+
+Each branch is inverse-volatility weighted within itself (`vol_12m`), the two branch portfolios are combined (weights summed if a ticker appears in both), and then a **regime filter** is applied: if Information Technology sector drawdown is worse than -20%, stock weights are scaled down and the freed weight moves to cash (100% cash when the filter trips, per `regime_filter.cash_weight_when_off` in the config).
+
+This step appends to `live_portfolio_signals.csv` (per-ticker target weight for the month), `live_run_summary.csv`, and `live_order_ledger.csv`.
+
+### 5. Rebalance orders vs. execution — two separate steps
+
+This distinction matters and was the source of a real bug: **generating a new signal does not move the portfolio.**
+
+- `scripts/generate_live_rebalance_orders.py` compares `current_live_holdings.csv` against the newest target signal and writes proposed BUY/SELL orders (`latest_live_rebalance_orders.csv`) — it only computes what *should* change, it does not touch holdings.
+- `scripts/apply_live_rebalance.py` is the step that actually executes the rebalance. It fetches **live prices right now** for every held and target ticker, values the current book at those live prices (the true dollar amount available to redeploy), buys the new target weights in whole shares at those same live prices, and puts the remainder in cash. The prior holdings file is backed up (`current_live_holdings.pre_rebalance_<timestamp>.csv`) before being overwritten. Executing at live "now" prices (not the signal's month-end price) matters so each position's cost basis is its real purchase price and since-entry P&L starts at zero, instead of silently including a few days of market movement between the signal date and the day you actually rebalance.
+
+### 6. Daily valuation and the SPY benchmark
+
+`scripts/check_ltsaf_live_value.py` is the daily mark-to-market job:
+
+- Fetches a live quote (current price + previous close) for every held ticker and SPY.
+- Computes day P&L / day return, and appends a row to `live_value_snapshots.csv`.
+- Computes a **true buy-and-hold SPY benchmark anchored at inception**: the first time this runs it records the portfolio's starting value and SPY's price on the inception date to `spy_benchmark_anchor.csv`, then every subsequent run values "what if you'd bought SPY instead" purely from `inception_value * (spy_price_today / spy_price_at_inception)`. Because it only depends on the inception anchor and the current price, the cumulative SPY gap stays correct even across days where no snapshot was logged at all.
+- If every stock quote fails (e.g. the machine had no internet when the scheduled task fired), the run is skipped entirely rather than writing a misleading cash-only snapshot that would show up as a value crash.
+
+`scripts/track_ltsaf_live_performance.py` separately evaluates each completed signal-to-next-signal holding period against realized monthly prices and SPY, and maintains cumulative return/drawdown stats in `live_performance_ledger.csv`.
+
+### 7. Dashboard
+
+`dashboard/ltsaf_live_dashboard.py` (Streamlit) reads all of the CSV/parquet artifacts above and renders a Robinhood-style local UI: portfolio value vs. the inception-anchored SPY benchmark, every current position (not just the top few) with live Day % / Since-Entry % colored green/red, per-branch signal detail, rebalance orders, and a system-health page. Data is cached per-session — use the "Refresh dashboard cache" button after running any of the pipeline scripts.
+
+### 8. Scheduling
+
+Three Windows Task Scheduler jobs (`schtasks.exe`, set up via `setup_daily_value_task.ps1`, `setup_live_monthly_task.ps1`, `setup_monthly_task.ps1`) drive the live system. Their batch/PowerShell launchers resolve their own folder (`%~dp0` / `$PSScriptRoot`) so they keep working if the project directory moves.
+
+| Task | Schedule | Runs | Does |
+|---|---|---|---|
+| `LatentMarketTwinDailyValueCheck` | Mon-Fri, 4:30 PM | `run_daily_value_check.bat` -> `check_ltsaf_live_value.py` | Daily mark-to-market + SPY gap |
+| `LatentMarketTwinLiveMonthlyRebuild` | 2nd of month, 9:30 AM | `run_live_rebuild.bat` -> `run_live_rebuild_pipeline.py` | Full refresh + retrain + new signal + rebalance orders (does **not** execute the trade — see step 5) |
+| `LatentMarketTwinMonthlyUpdate` | 1st of month, 9:00 AM | `run_monthly_update.bat` -> `run_monthly_update.py` | The older frozen research-baseline pipeline, kept separate from the live system |
+
+All three are configured to catch up on a missed run and wake the machine from sleep, but still need an internet connection at run time and (unless the logon type has been switched to S4U) need the user to be logged in.
+
+### 9. Running it manually
+
+```powershell
+cd C:\latent_market_twin
+
+# Daily value refresh
+.\.venv312\Scripts\python.exe scripts\check_ltsaf_live_value.py
+
+# Full monthly rebuild: refresh prices, rebuild features/latents, retrain, generate new signal + orders
+.\.venv312\Scripts\python.exe scripts\run_live_rebuild_pipeline.py
+
+# Execute the newest signal into actual holdings (whole shares, live prices)
+.\.venv312\Scripts\python.exe scripts\apply_live_rebalance.py
+
+# Dashboard
+.\.venv312\Scripts\python.exe -m streamlit run dashboard\ltsaf_live_dashboard.py
+```
+
+Key live outputs, all under `outputs/paper_trading_live/`: `current_live_holdings.csv` (what you actually hold), `live_portfolio_signals.csv` (monthly target weights), `latest_live_rebalance_orders.csv` (proposed trades), `live_value_snapshots.csv` and `spy_benchmark_anchor.csv` (daily value history + SPY benchmark), `live_performance_ledger.csv` (realized month-over-month performance).
+
+See also [PAPER_TRADING_RESULTS.md](PAPER_TRADING_RESULTS.md) for the actual month-by-month results and buy lists.
+
 ## Core Research Question
 
 Can latent twin or autoencoder-style models learn lower-dimensional market structures that improve one-year stock direction and market outperformance prediction?
