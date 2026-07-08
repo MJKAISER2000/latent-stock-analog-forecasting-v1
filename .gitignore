@@ -22,7 +22,7 @@ outputs/
 runs/
 checkpoints/
 logs/
-models/
+/models/
 
 # Large ML/data files
 *.csv
