@@ -1,7 +1,7 @@
 # Latent Market Twin — Daily Live Portfolio Value Task
 # Uses schtasks.exe for Windows compatibility.
 
-$ProjectRoot = "C:\ResearchCode\latent_market_twin"
+$ProjectRoot = $PSScriptRoot
 $BatPath = Join-Path $ProjectRoot "run_daily_value_check.bat"
 $TaskName = "LatentMarketTwinDailyValueCheck"
 

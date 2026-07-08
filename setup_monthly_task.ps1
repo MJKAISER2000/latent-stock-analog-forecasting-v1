@@ -1,7 +1,7 @@
 # Latent Market Twin — Monthly Task Scheduler Setup
 # Uses schtasks.exe because some PowerShell versions do not support New-ScheduledTaskTrigger -Monthly.
 
-$ProjectRoot = "C:\ResearchCode\latent_market_twin"
+$ProjectRoot = $PSScriptRoot
 $BatPath = Join-Path $ProjectRoot "run_monthly_update.bat"
 $TaskName = "LatentMarketTwinMonthlyUpdate"
 

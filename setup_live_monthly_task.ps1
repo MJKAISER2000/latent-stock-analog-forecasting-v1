@@ -1,7 +1,7 @@
 # Latent Market Twin — Live Monthly Rebuild Task
 # Runs the full live data refresh + feature rebuild + live signal generation pipeline.
 
-$ProjectRoot = "C:\ResearchCode\latent_market_twin"
+$ProjectRoot = $PSScriptRoot
 $BatPath = Join-Path $ProjectRoot "run_live_rebuild.bat"
 $TaskName = "LatentMarketTwinLiveMonthlyRebuild"
 

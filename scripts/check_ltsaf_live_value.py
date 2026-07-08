@@ -32,6 +32,13 @@ LATEST_LIVE_VALUE_DETAIL_PATH = LIVE_OUTPUT_DIR / "latest_live_value_detail.csv"
 LATEST_LIVE_VALUE_SUMMARY_PATH = LIVE_OUTPUT_DIR / "latest_live_value_summary.txt"
 LIVE_VALUE_VS_SPY_PLOT_PATH = FIGURES_DIR / "ltsaf_live_value_vs_spy.png"
 
+# Anchor for the SPY buy-and-hold benchmark (portfolio starting value + SPY price on the
+# paper-trading inception date). Persisted once so the SPY gap is measured from inception
+# and stays correct even when daily logging is skipped for a stretch of days.
+SPY_BENCHMARK_ANCHOR_PATH = LIVE_OUTPUT_DIR / "spy_benchmark_anchor.csv"
+CONFIG_PATH = "configs/live_model_config.yaml"
+DEFAULT_STARTING_CASH = 100000.0
+
 
 def load_live_holdings() -> pd.DataFrame:
     if not LIVE_HOLDINGS_PATH.exists():
@@ -183,32 +190,158 @@ def compute_live_value(holdings: pd.DataFrame, quotes: pd.DataFrame) -> tuple[pd
     return detail, snapshot
 
 
-def add_spy_comparison(snapshot: dict) -> dict:
-    spy = get_quote("SPY")
+def get_spy_benchmark_anchor(spy_current_price: float, holdings: pd.DataFrame) -> tuple[float, float]:
+    """Return (inception_value, spy_inception_price) for the SPY buy-and-hold benchmark.
 
-    spy_current = spy["current_price"]
-    spy_previous = spy["previous_close"]
+    The anchor is the portfolio's starting value and SPY's closing price on the paper-trading
+    inception date. It is computed once and persisted, so the SPY benchmark is a true
+    buy-and-hold from inception rather than something re-anchored to the portfolio every day.
+    This makes the SPY gap correct even if daily logging is skipped for a while, because the
+    benchmark only depends on the inception price and the current price -- not on a continuous
+    day-by-day chain of snapshots.
+    """
+    if SPY_BENCHMARK_ANCHOR_PATH.exists():
+        anchor = pd.read_csv(SPY_BENCHMARK_ANCHOR_PATH)
+        inception_value = float(anchor["inception_value"].iloc[0])
+        spy_inception_price = float(anchor["spy_inception_price"].iloc[0])
+        return inception_value, spy_inception_price
 
-    if pd.isna(spy_current) or pd.isna(spy_previous) or spy_previous <= 0:
-        snapshot["spy_previous_close"] = np.nan
-        snapshot["spy_current_price"] = np.nan
-        snapshot["spy_day_return"] = np.nan
-        snapshot["spy_equivalent_current_value"] = np.nan
-        snapshot["excess_day_return_vs_spy"] = np.nan
-        snapshot["excess_day_pnl_vs_spy"] = np.nan
-        return snapshot
+    # Inception value = configured starting cash (fall back to the known default).
+    inception_value = DEFAULT_STARTING_CASH
+    try:
+        from src.utils.config import load_config
 
-    spy_day_return = spy_current / spy_previous - 1.0
-    spy_equivalent_current_value = snapshot["previous_close_value"] * (1.0 + spy_day_return)
+        config = load_config(CONFIG_PATH)
+        inception_value = float(config["paper_trading"]["starting_cash"])
+    except Exception:
+        pass
 
+    # Inception date = earliest signal date the live holdings were established on.
+    inception_date = None
+    try:
+        if "last_signal_date" in holdings.columns:
+            dates = pd.to_datetime(holdings["last_signal_date"], errors="coerce").dropna()
+            if len(dates) > 0:
+                inception_date = dates.min().normalize()
+    except Exception:
+        pass
+
+    # SPY closing price on (or just before) the inception date.
+    spy_inception_price = np.nan
+    if inception_date is not None:
+        try:
+            hist = yf.Ticker("SPY").history(
+                start=(inception_date - pd.Timedelta(days=10)).strftime("%Y-%m-%d"),
+                end=(inception_date + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
+                interval="1d",
+                auto_adjust=False,
+            )
+            if len(hist) > 0:
+                hist.index = pd.to_datetime(hist.index).tz_localize(None).normalize()
+                on_or_before = hist[hist.index <= inception_date]
+                if len(on_or_before) > 0:
+                    spy_inception_price = float(on_or_before["Close"].iloc[-1])
+        except Exception:
+            pass
+
+    # Fallback: anchor to the current SPY price (benchmark simply starts flat from now).
+    if pd.isna(spy_inception_price) or spy_inception_price <= 0:
+        spy_inception_price = (
+            float(spy_current_price) if not pd.isna(spy_current_price) else np.nan
+        )
+
+    if not pd.isna(spy_inception_price) and spy_inception_price > 0:
+        LIVE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            [
+                {
+                    "inception_date": inception_date.date() if inception_date is not None else "",
+                    "inception_value": inception_value,
+                    "spy_inception_price": spy_inception_price,
+                }
+            ]
+        ).to_csv(SPY_BENCHMARK_ANCHOR_PATH, index=False)
+
+    return inception_value, spy_inception_price
+
+
+def add_spy_comparison(
+    snapshot: dict,
+    spy_current: float,
+    spy_previous: float,
+    inception_value: float,
+    spy_inception_price: float,
+) -> dict:
     snapshot["spy_previous_close"] = spy_previous
     snapshot["spy_current_price"] = spy_current
-    snapshot["spy_day_return"] = spy_day_return
-    snapshot["spy_equivalent_current_value"] = spy_equivalent_current_value
-    snapshot["excess_day_return_vs_spy"] = snapshot["day_return"] - spy_day_return
-    snapshot["excess_day_pnl_vs_spy"] = snapshot["current_value"] - spy_equivalent_current_value
+
+    # --- Single-day comparison (always based on SPY's real prior trading-day close). ---
+    if pd.isna(spy_current) or pd.isna(spy_previous) or spy_previous <= 0:
+        snapshot["spy_day_return"] = np.nan
+        snapshot["excess_day_return_vs_spy"] = np.nan
+        snapshot["excess_day_pnl_vs_spy"] = np.nan
+    else:
+        spy_day_return = spy_current / spy_previous - 1.0
+        snapshot["spy_day_return"] = spy_day_return
+        snapshot["excess_day_return_vs_spy"] = snapshot["day_return"] - spy_day_return
+        snapshot["excess_day_pnl_vs_spy"] = (
+            snapshot["day_pnl"] - snapshot["previous_close_value"] * spy_day_return
+        )
+
+    # --- Cumulative comparison anchored to inception (this is the real SPY gap). ---
+    if pd.isna(spy_current) or pd.isna(spy_inception_price) or spy_inception_price <= 0:
+        snapshot["spy_equivalent_current_value"] = np.nan
+        snapshot["spy_cumulative_return"] = np.nan
+        snapshot["excess_cumulative_return_vs_spy"] = np.nan
+        snapshot["excess_cumulative_pnl_vs_spy"] = np.nan
+    else:
+        spy_equivalent_current_value = inception_value * (spy_current / spy_inception_price)
+        portfolio_cumulative_return = snapshot["current_value"] / inception_value - 1.0
+        spy_cumulative_return = spy_current / spy_inception_price - 1.0
+
+        snapshot["spy_equivalent_current_value"] = spy_equivalent_current_value
+        snapshot["spy_cumulative_return"] = spy_cumulative_return
+        snapshot["excess_cumulative_return_vs_spy"] = (
+            portfolio_cumulative_return - spy_cumulative_return
+        )
+        snapshot["excess_cumulative_pnl_vs_spy"] = (
+            snapshot["current_value"] - spy_equivalent_current_value
+        )
 
     return snapshot
+
+
+def recompute_spy_benchmark(
+    snapshots: pd.DataFrame,
+    inception_value: float,
+    spy_inception_price: float,
+) -> pd.DataFrame:
+    """Recompute the cumulative SPY benchmark for every snapshot row from the inception anchor.
+
+    This corrects historical rows that were logged with the old method (which re-anchored the
+    SPY benchmark to the portfolio's own previous close each day) and guarantees the whole
+    series is consistent, even across stretches where daily logging was skipped.
+    """
+    out = snapshots.copy()
+
+    if (
+        pd.isna(spy_inception_price)
+        or spy_inception_price <= 0
+        or "spy_current_price" not in out.columns
+    ):
+        return out
+
+    spy_price = pd.to_numeric(out["spy_current_price"], errors="coerce")
+    current_value = pd.to_numeric(out["current_value"], errors="coerce")
+
+    out["spy_equivalent_current_value"] = inception_value * (spy_price / spy_inception_price)
+    out["spy_cumulative_return"] = spy_price / spy_inception_price - 1.0
+    out["excess_cumulative_return_vs_spy"] = (
+        current_value / inception_value - 1.0
+    ) - out["spy_cumulative_return"]
+    out["excess_cumulative_pnl_vs_spy"] = current_value - out["spy_equivalent_current_value"]
+
+    return out
 
 
 def append_snapshot(snapshot: dict) -> pd.DataFrame:
@@ -277,9 +410,13 @@ def save_summary(detail: pd.DataFrame, snapshot: dict) -> None:
     lines.append(f"Day return: {snapshot['day_return']:.2%}")
     lines.append("")
     lines.append(f"SPY day return: {snapshot['spy_day_return']:.2%}")
-    lines.append(f"SPY-equivalent current value: ${snapshot['spy_equivalent_current_value']:,.2f}")
     lines.append(f"Excess day return vs SPY: {snapshot['excess_day_return_vs_spy']:.2%}")
     lines.append(f"Excess day P&L vs SPY: ${snapshot['excess_day_pnl_vs_spy']:,.2f}")
+    lines.append("")
+    lines.append(f"SPY-equivalent value (buy & hold from inception): ${snapshot['spy_equivalent_current_value']:,.2f}")
+    lines.append(f"SPY cumulative return since inception: {snapshot['spy_cumulative_return']:.2%}")
+    lines.append(f"Cumulative excess return vs SPY: {snapshot['excess_cumulative_return_vs_spy']:.2%}")
+    lines.append(f"Cumulative gap vs SPY: ${snapshot['excess_cumulative_pnl_vs_spy']:,.2f}")
     lines.append("")
     lines.append(f"Cash value: ${snapshot['cash_value']:,.2f}")
     lines.append(f"Cash weight: {snapshot['cash_weight']:.2%}")
@@ -307,11 +444,45 @@ def main():
     quotes = get_quotes(tickers)
 
     detail, snapshot = compute_live_value(holdings, quotes)
-    snapshot = add_spy_comparison(snapshot)
+
+    # Guard against no-internet runs: if every stock quote failed, current_value would
+    # collapse to just the cash position. Skip writing so the history is not polluted
+    # with a misleading cash-only snapshot (these used to show up as a crash to ~$0).
+    stock_detail = detail[detail["ticker"] != "CASH"]
+    usable_quotes = int(pd.to_numeric(stock_detail["current_price"], errors="coerce").notna().sum())
+
+    if len(stock_detail) > 0 and usable_quotes == 0:
+        print("")
+        print("=" * 100)
+        print("LTSAF LIVE PORTFOLIO VALUE")
+        print("=" * 100)
+        print("No usable stock quotes were returned (likely no internet connection).")
+        print("Skipping snapshot write so the value history is not corrupted with a cash-only row.")
+        return
+
+    spy_quote = get_quote("SPY")
+    spy_current = pd.to_numeric(spy_quote["current_price"], errors="coerce")
+    spy_previous = pd.to_numeric(spy_quote["previous_close"], errors="coerce")
+
+    inception_value, spy_inception_price = get_spy_benchmark_anchor(spy_current, holdings)
+
+    snapshot = add_spy_comparison(
+        snapshot,
+        spy_current=spy_current,
+        spy_previous=spy_previous,
+        inception_value=inception_value,
+        spy_inception_price=spy_inception_price,
+    )
 
     detail.to_csv(LATEST_LIVE_VALUE_DETAIL_PATH, index=False)
 
     snapshots = append_snapshot(snapshot)
+
+    # Re-derive the cumulative SPY benchmark for the whole history from the inception anchor,
+    # so the SPY gap is correct even where past days were not logged.
+    snapshots = recompute_spy_benchmark(snapshots, inception_value, spy_inception_price)
+    snapshots.to_csv(LIVE_VALUE_SNAPSHOTS_PATH, index=False)
+
     make_plot(snapshots)
     save_summary(detail, snapshot)
 
@@ -327,9 +498,13 @@ def main():
     print(f"Day return: {snapshot['day_return']:.2%}")
     print("")
     print(f"SPY day return: {snapshot['spy_day_return']:.2%}")
-    print(f"SPY-equivalent current value: ${snapshot['spy_equivalent_current_value']:,.2f}")
     print(f"Excess day return vs SPY: {snapshot['excess_day_return_vs_spy']:.2%}")
     print(f"Excess day P&L vs SPY: ${snapshot['excess_day_pnl_vs_spy']:,.2f}")
+    print("")
+    print(f"SPY-equivalent value (buy & hold from inception): ${snapshot['spy_equivalent_current_value']:,.2f}")
+    print(f"SPY cumulative return since inception: {snapshot['spy_cumulative_return']:.2%}")
+    print(f"Cumulative excess return vs SPY: {snapshot['excess_cumulative_return_vs_spy']:.2%}")
+    print(f"Cumulative gap vs SPY: ${snapshot['excess_cumulative_pnl_vs_spy']:,.2f}")
     print("")
     print(f"Cash value: ${snapshot['cash_value']:,.2f}")
     print(f"Cash weight: {snapshot['cash_weight']:.2%}")

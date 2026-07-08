@@ -1,0 +1,45 @@
+project_name: latent_market_twin_v2
+version: LTSAF_v2_overlays
+
+inputs:
+  # v1 walk-forward books (signals stay identical to v1; v2 changes construction)
+  v1_holdings: outputs/cv_backtest/cv_holdings.csv
+  dataset: data/processed/live_full500_with_stock_latent_neighbors.parquet
+  monthly_prices: data/processed/live_500_monthly_prices.parquet
+
+outputs_dir: outputs/v2_backtest
+
+transaction_cost: 0.001
+folds: 5
+
+overlays:
+  # Buy dips / sell high: tilt weights within the stock sleeve toward names
+  # below their own 6-month moving average and away from extended names.
+  dip_tilt:
+    enabled: true
+    feature: price_to_ma_6m
+    strength: 1.0          # multiplier = 1 - strength * (price_to_ma - 1)
+    min_mult: 0.5
+    max_mult: 1.5
+
+  # Generic market hedge: when SPY closes below its 10-month MA, cut the stock
+  # sleeve to a fraction and hold the rest in cash. Faster than v1's
+  # tech-drawdown-20 filter, which only fired 7 of 114 months.
+  trend_hedge:
+    enabled: true
+    ma_months: 10
+    exposure_when_off: 0.4
+
+  # Volatility targeting: scale exposure so trailing realized vol of the
+  # strategy's own returns approaches the target. No leverage (max 1.0).
+  vol_target:
+    enabled: true
+    target_annual_vol: 0.15
+    window_months: 6
+    max_exposure: 1.0
+
+  # Lazy rebalance: ignore trades smaller than the band vs the drifted book.
+  # v1 pays ~2.1%/yr in costs at 1.5x monthly turnover; this claws it back.
+  no_trade_band:
+    enabled: true
+    band: 0.005

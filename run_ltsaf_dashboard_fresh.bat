@@ -1,5 +1,5 @@
 @echo off
-cd /d C:\ResearchCode\latent_market_twin
+cd /d "%~dp0"
 
 if exist .venv312\Scripts\activate.bat (
     call .venv312\Scripts\activate.bat
@@ -19,6 +19,6 @@ echo.
 echo ============================================================
 echo Launching LTSAF dashboard...
 echo ============================================================
-streamlit run dashboard\ltsaf_live_dashboard.py
+python -m python -m streamlit run dashboard\ltsaf_live_dashboard.py
 
 pause

@@ -18,6 +18,7 @@ LIVE_HOLDINGS_PATH = LIVE_OUTPUT_DIR / "current_live_holdings.csv"
 LIVE_SIGNALS_PATH = LIVE_OUTPUT_DIR / "live_portfolio_signals.csv"
 LIVE_RUN_SUMMARY_PATH = LIVE_OUTPUT_DIR / "live_run_summary.csv"
 LIVE_VALUE_SNAPSHOTS_PATH = LIVE_OUTPUT_DIR / "live_value_snapshots.csv"
+SPY_BENCHMARK_ANCHOR_PATH = LIVE_OUTPUT_DIR / "spy_benchmark_anchor.csv"
 LATEST_LIVE_VALUE_DETAIL_PATH = LIVE_OUTPUT_DIR / "latest_live_value_detail.csv"
 LIVE_REBALANCE_PATH = LIVE_OUTPUT_DIR / "latest_live_rebalance_orders.csv"
 LIVE_PERFORMANCE_PATH = LIVE_OUTPUT_DIR / "live_performance_ledger.csv"
@@ -207,6 +208,198 @@ def color_delta(value) -> str:
     return "green" if value >= 0 else "red"
 
 
+def color_pct_text(value) -> str:
+    """Inline CSS for a percentage cell: green if up, red if down, muted if flat/NA."""
+    try:
+        value = float(value)
+    except Exception:
+        return "color: #9aa4b2"
+
+    if pd.isna(value):
+        return "color: #9aa4b2"
+    if value > 0:
+        return "color: #16c784; font-weight: 600"
+    if value < 0:
+        return "color: #ea3943; font-weight: 600"
+    return "color: #9aa4b2"
+
+
+def apply_spy_benchmark(value_snapshots: pd.DataFrame, anchor: pd.DataFrame) -> pd.DataFrame:
+    """Recompute the SPY 'buy & hold from inception' benchmark for every snapshot row.
+
+    Buys SPY at the inception date with the portfolio's starting value
+    (shares = inception_value / spy_inception_price), holds that fixed share count,
+    and values it at each row's SPY price. This is independent of how the snapshot
+    column was stored and stays correct even across days that were never logged.
+    """
+    if len(value_snapshots) == 0 or "spy_current_price" not in value_snapshots.columns:
+        return value_snapshots
+
+    out = value_snapshots.copy()
+
+    inception_value = None
+    spy_inception_price = None
+
+    if len(anchor) > 0 and "spy_inception_price" in anchor.columns:
+        try:
+            spy_inception_price = float(anchor["spy_inception_price"].iloc[0])
+            inception_value = float(anchor["inception_value"].iloc[0])
+        except Exception:
+            spy_inception_price = None
+
+    if spy_inception_price is None or spy_inception_price <= 0:
+        # Fallback: anchor to the earliest snapshot we have.
+        sp = pd.to_numeric(out["spy_current_price"], errors="coerce").dropna()
+        cv = pd.to_numeric(out["current_value"], errors="coerce").dropna()
+        if len(sp) > 0 and len(cv) > 0:
+            spy_inception_price = float(sp.iloc[0])
+            inception_value = float(cv.iloc[0])
+
+    if not spy_inception_price or spy_inception_price <= 0 or not inception_value:
+        return out
+
+    spy_price = pd.to_numeric(out["spy_current_price"], errors="coerce")
+    current_value = pd.to_numeric(out["current_value"], errors="coerce")
+
+    out["spy_equivalent_current_value"] = inception_value * (spy_price / spy_inception_price)
+    out["spy_cumulative_return"] = spy_price / spy_inception_price - 1.0
+    out["excess_cumulative_return_vs_spy"] = (
+        current_value / inception_value - 1.0
+    ) - out["spy_cumulative_return"]
+    out["excess_cumulative_pnl_vs_spy"] = current_value - out["spy_equivalent_current_value"]
+
+    return out
+
+
+def cumulative_vs_spy(value_snapshots: pd.DataFrame, anchor: pd.DataFrame):
+    """Return (gap_dollars, excess_return) of the portfolio vs SPY since inception."""
+    if len(value_snapshots) == 0:
+        return None, None
+
+    cols = value_snapshots.columns
+    if "spy_equivalent_current_value" not in cols or "current_value" not in cols:
+        return None, None
+
+    last = value_snapshots.iloc[-1]
+    cv = pd.to_numeric(pd.Series([last.get("current_value")]), errors="coerce").iloc[0]
+    spv = pd.to_numeric(pd.Series([last.get("spy_equivalent_current_value")]), errors="coerce").iloc[0]
+
+    if pd.isna(cv) or pd.isna(spv):
+        return None, None
+
+    gap = float(cv - spv)
+
+    inception_value = None
+    if len(anchor) > 0 and "inception_value" in anchor.columns:
+        try:
+            inception_value = float(anchor["inception_value"].iloc[0])
+        except Exception:
+            inception_value = None
+
+    if not inception_value:
+        first_cv = pd.to_numeric(value_snapshots["current_value"], errors="coerce").dropna()
+        inception_value = float(first_cv.iloc[0]) if len(first_cv) > 0 else None
+
+    excess = gap / inception_value if inception_value else None
+    return gap, excess
+
+
+def build_positions(holdings: pd.DataFrame, value_detail: pd.DataFrame) -> pd.DataFrame:
+    """Combine current holdings with the latest live valuation so per-stock prices,
+    day moves, and since-entry returns reflect *current* prices (the holdings CSV's
+    last_price/market_value are frozen at the last rebalance)."""
+    if len(holdings) == 0:
+        return pd.DataFrame()
+
+    h = holdings.copy()
+    h["ticker"] = h["ticker"].astype(str).str.strip().str.upper()
+
+    for c in ["shares", "avg_entry_price", "last_price", "market_value", "current_weight"]:
+        if c in h.columns:
+            h[c] = pd.to_numeric(h[c], errors="coerce")
+
+    if len(value_detail) > 0 and "current_price" in value_detail.columns:
+        vd = value_detail.copy()
+        vd["ticker"] = vd["ticker"].astype(str).str.strip().str.upper()
+        keep = ["ticker"]
+        vd["current_price"] = pd.to_numeric(vd.get("current_price"), errors="coerce")
+        keep.append("current_price")
+        if "day_return" in vd.columns:
+            vd["day_return"] = pd.to_numeric(vd["day_return"], errors="coerce")
+            keep.append("day_return")
+        if "current_value" in vd.columns:
+            vd["live_value"] = pd.to_numeric(vd["current_value"], errors="coerce")
+            keep.append("live_value")
+        h = h.merge(vd[keep].drop_duplicates("ticker"), on="ticker", how="left")
+
+    if "current_price" not in h.columns:
+        h["current_price"] = h.get("last_price")
+    else:
+        h["current_price"] = h["current_price"].fillna(h.get("last_price"))
+
+    if "day_return" not in h.columns:
+        h["day_return"] = np.nan
+
+    if "live_value" in h.columns:
+        h["live_market_value"] = h["live_value"].fillna(h["shares"] * h["current_price"])
+    else:
+        h["live_market_value"] = h["shares"] * h["current_price"]
+
+    h["since_entry_pct"] = np.where(
+        h.get("avg_entry_price", pd.Series(np.nan, index=h.index)) > 0,
+        h["current_price"] / h["avg_entry_price"] - 1.0,
+        np.nan,
+    )
+
+    total = float(h["live_market_value"].sum())
+    h["live_weight"] = h["live_market_value"] / total if total > 0 else 0.0
+
+    return h
+
+
+def render_positions_table(positions: pd.DataFrame, include_cash: bool = True) -> None:
+    """Render a positions table with green/red Day % and Since Entry % columns."""
+    if len(positions) == 0:
+        st.info("No positions to display.")
+        return
+
+    pos = positions.copy()
+    if not include_cash:
+        pos = pos[pos["ticker"] != "CASH"]
+
+    pos = pos.sort_values("live_market_value", ascending=False)
+
+    show = pd.DataFrame(
+        {
+            "Ticker": pos["ticker"],
+            "Shares": pos["shares"],
+            "Price": pos["current_price"],
+            "Day %": pos["day_return"],
+            "Since Entry %": pos["since_entry_pct"],
+            "Market Value": pos["live_market_value"],
+            "Portfolio %": pos["live_weight"],
+        }
+    )
+
+    styler = (
+        show.style
+        .map(color_pct_text, subset=["Day %", "Since Entry %"])
+        .format(
+            {
+                "Shares": "{:,.0f}",
+                "Price": "${:,.2f}",
+                "Day %": "{:+.2%}",
+                "Since Entry %": "{:+.2%}",
+                "Market Value": "${:,.2f}",
+                "Portfolio %": "{:.2%}",
+            },
+            na_rep="N/A",
+        )
+    )
+
+    st.dataframe(styler, use_container_width=True, hide_index=True)
+
+
 def latest_timestamped_file(pattern: str) -> Path | None:
     files = sorted(glob.glob(pattern))
 
@@ -351,6 +544,7 @@ def load_all_data() -> dict:
     signals = safe_read_csv(LIVE_SIGNALS_PATH)
     run_summary = safe_read_csv(LIVE_RUN_SUMMARY_PATH)
     value_snapshots = safe_read_csv(LIVE_VALUE_SNAPSHOTS_PATH)
+    spy_anchor = safe_read_csv(SPY_BENCHMARK_ANCHOR_PATH)
     value_detail = safe_read_csv(LATEST_LIVE_VALUE_DETAIL_PATH)
     rebalance = safe_read_csv(LIVE_REBALANCE_PATH)
     performance = safe_read_csv(LIVE_PERFORMANCE_PATH)
@@ -409,6 +603,7 @@ def load_all_data() -> dict:
         "signals": signals,
         "run_summary": run_summary,
         "value_snapshots": value_snapshots,
+        "spy_anchor": spy_anchor,
         "value_detail": value_detail,
         "rebalance": rebalance,
         "performance": performance,
@@ -491,7 +686,15 @@ monthly_prices = data["monthly_prices"]
 holdings = data["holdings"]
 signals = data["signals"]
 value_snapshots = data["value_snapshots"]
+spy_anchor = data["spy_anchor"]
 value_detail = data["value_detail"]
+
+# Recompute the SPY benchmark as a true buy-and-hold from inception so every chart
+# that reads spy_equivalent_current_value shows the correct gap vs the portfolio.
+value_snapshots = apply_spy_benchmark(value_snapshots, spy_anchor)
+
+# Live per-stock view: current price, day move, and since-entry return for every position.
+positions = build_positions(holdings, value_detail)
 rebalance = data["rebalance"]
 performance = data["performance"]
 live_dataset = data["live_dataset"]
@@ -641,10 +844,19 @@ day_return = float(latest_value.get("day_return", 0) or 0)
 spy_day_return = float(latest_value.get("spy_day_return", 0) or 0)
 excess_day_return = float(latest_value.get("excess_day_return_vs_spy", 0) or 0)
 
+spy_gap_dollars, spy_excess_return = cumulative_vs_spy(value_snapshots, spy_anchor)
+
 col_a, col_b, col_c, col_d = st.columns(4)
 col_a.metric("Portfolio Value", fmt_money(total_value), f"{day_pnl:+,.2f} today")
 col_b.metric("Day Return", fmt_pct(day_return), f"SPY {fmt_pct(spy_day_return)}")
-col_c.metric("Excess vs SPY", fmt_pct(excess_day_return))
+if spy_excess_return is not None:
+    col_c.metric(
+        "Excess vs SPY (since start)",
+        fmt_pct(spy_excess_return),
+        f"{spy_gap_dollars:+,.0f} $",
+    )
+else:
+    col_c.metric("Excess vs SPY", fmt_pct(excess_day_return))
 col_d.metric("Cash Weight", fmt_pct(cash_weight), f"{stock_positions} stocks")
 
 st.markdown("---")
@@ -705,49 +917,10 @@ with tabs[0]:
         st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown('<div class="rh-card">', unsafe_allow_html=True)
-        st.markdown('<div class="rh-title">Top Holdings</div>', unsafe_allow_html=True)
+        st.markdown('<div class="rh-title">Holdings — all positions</div>', unsafe_allow_html=True)
 
-        if len(holdings) > 0:
-            h = holdings[holdings["ticker"] != "CASH"].copy()
-            h = h.sort_values("market_value", ascending=False).head(12)
-
-            show_cols = [
-                "ticker",
-                "shares",
-                "last_price",
-                "market_value",
-                "current_weight",
-                "avg_entry_price",
-            ]
-            show_cols = [c for c in show_cols if c in h.columns]
-            show = h[show_cols].copy()
-
-            show = show.rename(
-                columns={
-                    "ticker": "Ticker",
-                    "shares": "Shares",
-                    "last_price": "Price",
-                    "market_value": "Market Value",
-                    "current_weight": "Portfolio %",
-                    "avg_entry_price": "Avg Entry",
-                }
-            )
-
-            st.dataframe(
-                show,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Price": st.column_config.NumberColumn(format="$%.2f"),
-                    "Market Value": st.column_config.NumberColumn(format="$%.2f"),
-                    "Portfolio %": st.column_config.ProgressColumn(
-                        format="%.2f",
-                        min_value=0,
-                        max_value=max(show["Portfolio %"].max(), 0.01) if "Portfolio %" in show.columns else 1.0,
-                    ),
-                    "Avg Entry": st.column_config.NumberColumn(format="$%.2f"),
-                },
-            )
+        if len(positions) > 0:
+            render_positions_table(positions, include_cash=False)
         else:
             st.info("No holdings found.")
 
@@ -870,35 +1043,12 @@ with tabs[1]:
                 st.info("No sector metadata available.")
 
         st.markdown("### Full Holdings Table")
+        st.caption("Live prices. Day % and Since Entry % are green when up, red when down.")
 
-        display = view.copy()
-        display = display.rename(
-            columns={
-                "ticker": "Ticker",
-                "shares": "Shares",
-                "avg_entry_price": "Avg Entry",
-                "last_price": "Last Price",
-                "market_value": "Market Value",
-                "current_weight": "Portfolio %",
-                "source": "Source",
-            }
-        )
-
-        st.dataframe(
-            display,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Avg Entry": st.column_config.NumberColumn(format="$%.2f"),
-                "Last Price": st.column_config.NumberColumn(format="$%.2f"),
-                "Market Value": st.column_config.NumberColumn(format="$%.2f"),
-                "Portfolio %": st.column_config.ProgressColumn(
-                    format="%.2f",
-                    min_value=0,
-                    max_value=max(display["Portfolio %"].max(), 0.01) if "Portfolio %" in display.columns else 1.0,
-                ),
-            },
-        )
+        if len(positions) > 0:
+            render_positions_table(positions, include_cash=True)
+        else:
+            st.info("No holdings found.")
 
 
 # =============================================================================
@@ -1809,10 +1959,10 @@ with tabs[7]:
     st.markdown("### Commands")
     st.code(
         r"""
-cd C:\ResearchCode\latent_market_twin
+cd C:\latent_market_twin
 .\.venv312\Scripts\Activate.ps1
 
-streamlit run dashboard\ltsaf_live_dashboard.py
+python -m streamlit run dashboard\ltsaf_live_dashboard.py
 
 python scripts\run_live_rebuild_pipeline.py
 python scripts\check_ltsaf_live_value.py
